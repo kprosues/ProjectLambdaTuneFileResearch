@@ -8,6 +8,7 @@ These ECU tune files are JSON-formatted calibration files for a JDM Subaru WRX S
 - `AF041_base.tune`: Version 1.6.33.2 (Latest Schema)
 - `Keith Proseus_1999JDMSTI_DW740_VF28_21builtStroker_v3.tune`: Version 1.6.32.1
 - `Keith Proseus_1999JDMSTI_DW740_VF28_21builtStroker_v7_keith_edit.tune`: Version 1.6.36.2
+- `Keith Proseus_1999JDMSTI_DW740_VF28_21builtStroker_v10_20251203_155625.tune`: Version 1.6.38.0 (DFCO Analysis)
 
 ## File Structure
 - **Metadata**: `.cal_id`, `.car_id`, `.meta`, `.rom_id`, `.version`
@@ -185,7 +186,10 @@ These ECU tune files are JSON-formatted calibration files for a JDM Subaru WRX S
 #### Configuration:
 - `boost_iat_enable_at` - Enable IAT compensation for AT (1 = enabled)
 - `boost_iat_enable_mt` - Enable IAT compensation for MT (1 = enabled)
-- `boost_prop_enable` - Enable proportional boost control (0 = disabled)
+- `boost_prop_enable` - Enable proportional boost control (0 = disabled, 1 = enabled)
+  - **Single turbo ECUs only** - Adds P (proportional) term to wastegate control algorithm
+  - **v11 tune value**: 1 (enabled for improved boost response)
+  - See **Section 6: WASTEGATE CONTROL - Proportional Correction Mode** for details
 - `boost_doubler` - Boost doubler feature enable (0 = disabled)
 
 **Relationships**: Boost target is the desired pressure. Wastegate control (see below) adjusts to achieve target. Limits prevent overboost.
@@ -195,12 +199,16 @@ These ECU tune files are JSON-formatted calibration files for a JDM Subaru WRX S
 ### 6. WASTEGATE CONTROL
 **Purpose**: Control wastegate duty cycle to achieve boost targets
 
+**Important**: **Lower wastegate duty cycle results in less boost pressure. Higher wastegate duty cycle results in more boost pressure.** This relationship is fundamental to understanding boost control behavior.
+
 **Related Tables:**
 - `wastegate_enable` - Master enable for wastegate control (1 = enabled)
 - `wg_base` (%) - Base wastegate duty cycle table (8x8: RPM x TPS)
-  - Range: 0.0% (closed) to 80.5% (open)
+  - Range: 0.0% to 80.5%
+  - **Lower values = less boost, higher values = more boost**
 - `wg_max` (%) - Maximum wastegate duty cycle table (8x8: RPM x TPS)
   - Range: 0.0% to 90.6%
+  - **Lower values = less boost, higher values = more boost**
 - `wg_rpm_index` (rpm) - RPM breakpoints (same as boost_target_rpm_index)
 - `wg_tps_index` (%) - TPS breakpoints (same as boost_target_tps_index)
 
@@ -213,18 +221,113 @@ These ECU tune files are JSON-formatted calibration files for a JDM Subaru WRX S
 - `wg_update_interval` (ms) - Update rate for wastegate control (120 ms)
 - `wg_overboost_step` (%) - Duty reduction steps when overboost detected (4 values: 3.1, 1.6, 0.8, 0.4)
   - **Indexed by `boost_error_index`**: Each value corresponds to a boost error threshold
+  - **Integral-only mode**: Used as duty cycle adjustment steps
+  - **Proportional mode disabled**: This is the primary control table
 - `wg_overboost_step_transition` (%) - Transition steps for overboost (4 values: 6.2, 3.1, 1.6, 0.8)
   - **Indexed by `boost_error_index`**
+  - **When proportional boost control enabled**: Used to lookup the proportional error term
+  - **Proportional mode**: This becomes the primary control table for instant large corrections
 - `wg_underboost_step` (%) - Duty increase steps when underboost detected (4 values: 3.1, 1.6, 0.8, 0.4)
   - **Indexed by `boost_error_index`**: Each value corresponds to a boost error threshold
+  - **Integral-only mode**: Used as duty cycle adjustment steps
+  - **Proportional mode disabled**: This is the primary control table
 - `wg_underboost_step_transition` (%) - Transition steps for underboost (4 values: 6.2, 3.1, 1.6, 0.8)
   - **Indexed by `boost_error_index`**
+  - **When proportional boost control enabled**: Used to lookup the proportional error term
+  - **Proportional mode**: This becomes the primary control table for instant large corrections
 - `wg_integral_limit` (%) - Integral term limit for PID control (0.0%)
+  - **When proportional boost control enabled**: Limits the positive and negative magnitude of the integral term
+  - Example: 10.2% limits the wastegate duty integral term to between -10.2% and +10.2%
+  - **Prevents integral windup** and improves stability
 - `wg_secondary_enable` - Enable secondary wastegate (0 = disabled)
 
-**Boost Error Control**: When actual boost deviates from target boost, the error magnitude (in kPa) is used to look up the appropriate adjustment step from these tables. The `boost_error_index` provides shared breakpoints (20.3, 11.7, 5.3, 2.1 kPa) so all four step tables use the same error thresholds. Larger errors result in larger duty cycle adjustments.
+#### Proportional Correction Mode (Single Turbo Only):
+**Reference**: [Lambda Tuning - Boost Control](https://lambdatuning.com/support/guide/vehicles/boost-control.html#map-interpolation)
 
-**Relationships**: Wastegate control is a closed-loop system that adjusts duty cycle to achieve `boost_target` while respecting `boost_limit`.
+**Control Algorithm Comparison:**
+
+**Factory Algorithm (Integral-only):**
+- Equivalent to a PID controller with only the **I (integral) term** enabled
+- Wastegate output is increased or decreased by a pre-set amount (`wg_overboost_step` or `wg_underboost_step`)
+- Multiple updates required until boost target is reached
+- **Limitations**: 
+  - Slow turbo response when initial duty value is far from required value
+  - Increasing step amount causes boost overshoot and oscillation
+
+**Proportional Correction Algorithm:**
+- Adds a **P (proportional) term** to the algorithm for faster response
+- Enables large duty cycle changes instantly based on boost error magnitude
+- **Benefits**:
+  - Faster turbo spool
+  - Quicker corrections to prevent boost spikes
+  - Better boost target tracking
+
+**Enable/Disable:**
+- `boost_prop_enable` - Enable proportional boost control (1 = enabled, 0 = disabled)
+  - **v11 tune value**: 1 (enabled)
+
+**How It Works:**
+
+When `boost_prop_enable = 1`:
+1. **Proportional Term**: `wg_overboost_step_transition` and `wg_underboost_step_transition` become the proportional error lookup tables
+   - Boost error (in kPa) is indexed against `boost_error_index` (20.3, 11.7, 5.3, 2.1 kPa)
+   - Larger errors trigger larger instant duty cycle adjustments
+   - Example (v11): If boost error is 20.3 kPa over target, proportional term applies 5.1% instant reduction
+
+2. **Integral Term**: `wg_overboost_step` and `wg_underboost_step` continue as integral adjustment steps
+   - Applied gradually over multiple update cycles (120 ms intervals)
+   - Magnitude limited by `wg_integral_limit` to prevent windup
+   - Example (v11): Integral term capped at ±10.2%
+
+3. **Final Duty Cycle**:
+   ```
+   Wastegate Duty = wg_base + Proportional_Term + Integral_Term
+   (Clamped to 0% - wg_max)
+   ```
+
+**Tuning Proportional Correction:**
+
+**Step 1: Enable Proportional Mode**
+- Set `boost_prop_enable: 1`
+
+**Step 2: Set Integral Limit**
+- Start with `wg_integral_limit: 10.0` to 15.0%
+- Higher values: More aggressive integral correction (risk of overshoot)
+- Lower values: More conservative (slower final convergence)
+- **v11 tune**: 10.2% (moderate, safe for stock turbo)
+
+**Step 3: Tune Transition Tables (Proportional Term)**
+- `wg_overboost_step_transition`: How aggressively to reduce duty when overboost occurs
+  - **v11 values**: 5.1, 3.1, 2.0, 1.6 (% reduction for errors 20.3, 11.7, 5.3, 2.1 kPa)
+  - Larger values = faster boost spike prevention
+  - Too large = undershoot and oscillation
+  
+- `wg_underboost_step_transition`: How aggressively to increase duty when underboost occurs
+  - **v11 values**: 5.9, 2.7, 1.2, 0.4 (% increase for errors 20.3, 11.7, 5.3, 2.1 kPa)
+  - Larger values = faster turbo spool
+  - Too large = overshoot and oscillation
+
+**Step 4: Tune Step Tables (Integral Term)**
+- `wg_overboost_step` and `wg_underboost_step` now act as fine-tuning corrections
+- Generally use smaller values than transition tables
+- **v11 values**: 
+  - Overboost: 8.6, 5.5, 3.9, 3.1 (still active but integral-limited)
+  - Underboost: 2.7, 1.2, 0.4, 0.0 (minimal integral correction)
+
+**Tuning Tips:**
+
+1. **Start Conservative**: Begin with lower transition values and increase gradually
+2. **Log Boost Response**: Monitor boost vs target with datalogging
+3. **Check for Overshoot**: If boost overshoots target significantly, reduce transition values
+4. **Check for Oscillation**: If boost oscillates around target, reduce transition values or increase integral limit
+5. **Spool Testing**: Test acceleration from low RPM (2500-3000) in 3rd gear, full throttle
+6. **Spike Prevention**: Test sudden throttle application at high RPM to verify overboost correction
+
+**Boost Error Control**: When actual boost deviates from target boost, the error magnitude (in kPa) is used to look up the appropriate adjustment step from these tables. The `boost_error_index` provides shared breakpoints (20.3, 11.7, 5.3, 2.1 kPa) so all four step tables use the same error thresholds. Larger errors result in larger duty cycle adjustments.
+- **Overboost**: When actual boost exceeds target, duty cycle is **reduced** (via `wg_overboost_step_transition` in proportional mode) to decrease boost pressure
+- **Underboost**: When actual boost is below target, duty cycle is **increased** (via `wg_underboost_step_transition` in proportional mode) to increase boost pressure
+
+**Relationships**: Wastegate control is a closed-loop system that adjusts duty cycle to achieve `boost_target` while respecting `boost_limit`. **Remember: lower duty cycle = less boost, higher duty cycle = more boost.** The system increases duty cycle when boost is too low and decreases duty cycle when boost is too high. With proportional correction enabled, the system responds much faster to boost errors, improving spool time and preventing dangerous boost spikes.
 
 ---
 
@@ -400,25 +503,127 @@ These ECU tune files are JSON-formatted calibration files for a JDM Subaru WRX S
 ---
 
 ### 16. DECELERATION FUEL CUT-OFF (DFCO)
-**Purpose**: Cut fuel during deceleration for emissions and fuel economy
+**Purpose**: Cut fuel during deceleration for emissions and fuel economy. When activated, completely stops fuel injection during closed-throttle deceleration.
+
+**System Overview:**
+- **Master Control**: `dfco_enable` (1 = ON in v10)
+- **Activation Method**: Multi-condition logic with RPM, vehicle speed, delay timers, and gear position
+- **Fuel Economy Impact**: 5-10% improvement in city driving when active
+- **Emissions Benefit**: Eliminates unburned fuel during deceleration
 
 **Related Tables:**
-- `dfco_enable` - Master enable for DFCO (1 = enabled)
-- `dfco_enable_rpm_a` (rpm) - RPM thresholds to enable DFCO (2x16: gear x ECT)
-  - Range: 2100 to 3700 rpm
-- `dfco_enable_rpm_b` (rpm) - Alternative RPM thresholds (2x16: gear x ECT)
-  - Range: 1300 to 3400 rpm
+
+#### Master Enable:
+- `dfco_enable` - Master enable for DFCO (1 = enabled in v10)
+  - 0 = DFCO completely disabled (fuel continues during all deceleration)
+  - 1 = DFCO enabled (system uses threshold tables to determine activation)
+
+#### Activation Delay System:
+- `dfco_delay` - Delay counters before DFCO activates (2x4 table)
+  - v10 values: "4, 4, 4, 0" (row 1), "4, 4, 4, 0" (row 2)
+  - Indexed by `dfco_delay_rpm` breakpoints
+  - Effect: ~0.5 second delay at RPM < 4000, immediate at RPM ≥ 4000
+  - Purpose: Prevents premature fuel cut during brief throttle lifts
+- `dfco_delay_rpm` (rpm) - RPM breakpoints for delay (3 values: 1600, 2400, 4000)
+  - Creates 4 RPM zones with different delay requirements
+- `dfco_delay_neutral` - Delay in neutral (3 values: 1500, 3500, 15000)
+  - Very long delays effectively prevent DFCO in neutral
+  - Maintains idle stability when not in gear
+
+#### RPM Threshold Tables (Enable):
+- `dfco_enable_rpm_a` (rpm) - Primary RPM thresholds to enable DFCO (2x16: condition x ECT)
+  - Row 1: 3400 → 2100 rpm (cold to hot engine)
+  - Row 2: 3700 → 2250 rpm (alternative condition set)
+  - Higher RPM required when cold, lower when warm
+- `dfco_enable_rpm_b` (rpm) - Secondary RPM thresholds (2x16: condition x ECT)
+  - Row 1: 3100 → 1300 rpm (alternative thresholds)
+  - Row 2: 3400 → 1700 rpm (generally lower than table A)
+  - Used under different load/vehicle speed conditions
 - `dfco_enable_rpm_neutral` (rpm) - RPM thresholds in neutral (3x2: condition x threshold)
   - Values: 5600, 5100; 4000, 3500; 2600, 1900
-- `dfco_disable_rpm` (rpm) - RPM thresholds to disable DFCO (2x16: gear x ECT)
-  - Range: 1100 to 2900 rpm
-- `dfco_disable_rpm_neutral` (rpm) - Disable thresholds in neutral (2 values: 1500, 1250)
-- `dfco_delay` - Delay counters before DFCO activates (2x4 table: 4, 4, 4, 0)
-- `dfco_delay_rpm` (rpm) - RPM breakpoints for delay (3 values: 1600, 2400, 4000)
-- `dfco_delay_neutral` - Delay in neutral (3 values: 1500, 3500, 15000)
-- `dfco_vss_threshold` (km/h) - Vehicle speed thresholds for DFCO (3 values: 24, 22, 16 km/h)
+  - Very high thresholds make DFCO rare in neutral gear
 
-**Relationships**: DFCO activates when throttle is closed above certain RPM/load conditions. Prevents engine braking and reduces emissions.
+#### RPM Threshold Tables (Disable):
+- `dfco_disable_rpm` (rpm) - RPM thresholds to disable DFCO (2x16: condition x ECT)
+  - v10 values: 2900 → 1100 rpm (decreasing with temperature)
+  - **Hysteresis Design**: Disable thresholds are 500-1000 rpm LOWER than enable thresholds
+  - Prevents rapid on/off cycling as RPM decreases
+- `dfco_disable_rpm_neutral` (rpm) - Disable thresholds in neutral (2 values: 1500, 1250)
+  - If DFCO activates in neutral, deactivates by 1500-1250 rpm for smooth idle
+
+#### Vehicle Speed Requirements:
+- `dfco_vss_threshold` (km/h) - Minimum vehicle speed for DFCO (3 values: 24, 22, 16)
+  - Approximately 15, 14, 10 mph
+  - DFCO disabled below these speeds to prevent stalling during stops
+  - Ensures smooth transitions at low speeds
+
+**Operational Logic:**
+
+**DFCO Activates When ALL Conditions Met:**
+```
+├── dfco_enable = 1 (master switch ON)
+├── Throttle Position = 0% (closed throttle)
+├── RPM > dfco_enable_rpm_a OR dfco_enable_rpm_b (indexed by ECT)
+├── Vehicle Speed > dfco_vss_threshold
+├── Gear NOT in neutral (or neutral-specific thresholds met)
+├── dfco_delay counter satisfied (time delay elapsed)
+└── No conflicting conditions (WOT, PE mode, etc.)
+
+Result: Fuel injector duty cycle → 0%, AFR → lean (18:1+)
+```
+
+**DFCO Deactivates When ANY Condition Met:**
+```
+├── Throttle opens (TPS > ~2%)
+├── RPM drops below dfco_disable_rpm (indexed by ECT)
+├── Vehicle Speed drops below dfco_vss_threshold
+├── Gear shifted to neutral (and RPM < dfco_disable_rpm_neutral)
+└── Driver input detected (acceleration request)
+
+Result: Fuel delivery resumes, AFR returns to normal
+```
+
+**Hysteresis Behavior:**
+- Enable threshold (warm): ~3000-3400 rpm
+- Disable threshold (warm): ~2400 rpm
+- Hysteresis band: ~600-1000 rpm
+- **Purpose**: Once DFCO activates, it remains active until RPM drops significantly lower, preventing rapid cycling
+
+**Typical Deceleration Example (v10, Warm Engine, 3rd Gear, 60 km/h):**
+```
+Time    RPM     TPS    VSS      DFCO    Fuel%   AFR     Event
+--------------------------------------------------------------
+0.0s    4500    65%    95 km/h  OFF     85%     11.8    WOT
+0.5s    4400    0%     90 km/h  OFF     42%     12.5    Throttle closed
+1.0s    4000    0%     80 km/h  ON      0%      18+     DFCO activates (delay + RPM met)
+1.5s    3500    0%     65 km/h  ON      0%      18+     DFCO continues
+2.0s    3000    0%     50 km/h  ON      0%      18+     DFCO continues
+2.5s    2400    0%     35 km/h  OFF     15%     14.7    DFCO deactivates (RPM threshold)
+3.0s    2000    0%     25 km/h  OFF     12%     14.5    Normal decel fuel
+```
+
+**Relationships**: 
+- DFCO is mutually exclusive with Power Enrichment (PE) mode
+- When DFCO active, `closed_throttle_spark` timing is irrelevant (no fuel to ignite)
+- `fuel_base` table bypassed entirely when DFCO active (injector duty = 0%)
+- Works with `closed_throttle_spark_vss_max` to control behavior at various speeds
+
+**Interaction with Burble Tuning:**
+- **⚠️ DFCO is the PRIMARY OBSTACLE to burble tuning**
+- Burbles require fuel flow during closed-throttle deceleration
+- Normal DFCO: `Throttle Closed → Fuel Cut → Silent`
+- Burble Mode: `Throttle Closed → Fuel Continues → Spark Retard → POP/BANG`
+
+**DFCO Modifications for Burble Tuning:**
+1. **Increase Delay**: Current v10 = 4 counts → Recommended = 15-20 counts (~1.8-2.4s delay)
+2. **Raise RPM Thresholds**: Add +1500-2000 rpm to enable thresholds (allows fuel in burble range)
+3. **Extreme Option**: Set `dfco_enable = 0` (complete disable, significant fuel economy penalty)
+
+**Safety Notes:**
+- Disabling/delaying DFCO increases fuel consumption and carbon buildup
+- Requires catless exhaust if used for burble tuning (unburned fuel destroys catalysts)
+- Monitor AFR (11.5-13.5:1 target) and EGT (<950°C) when modifying DFCO
+- More frequent spark plug changes required with delayed/disabled DFCO
 
 ---
 
@@ -812,13 +1017,18 @@ Target Boost Pressure
 Compare with Actual Boost → Calculate Boost Error (kPa)
     ↓
 [If Overboost] → Lookup wg_overboost_step using boost_error_index
+                 → REDUCE duty cycle (less duty = less boost)
 [If Underboost] → Lookup wg_underboost_step using boost_error_index
+                 → INCREASE duty cycle (more duty = more boost)
     ↓
 Adjust wg_base duty cycle by step amount
     ↓
 Respect boost_limit and wg_max
     ↓
 Final Wastegate Duty Cycle
+    ↓
+Lower duty = Less boost pressure
+Higher duty = More boost pressure
 ```
 
 ### 4. Idle Control Flow:
@@ -863,13 +1073,27 @@ Final Idle Air Valve Duty Cycle
 - Most aggressive tune - higher boost, richer fuel, more spark advance
 - Different `wideband_cal` values (0.500-1.523 λ vs 0.680-1.367 λ in base)
 
+**Version 1.6.38.0 (v10):**
+- Extended load index range (0.13-2.74 g/rev) - consistent with v3/v7
+- Modified `boost_target_tps_index`: 0.00, 18.80, 21.90, 28.10, 34.40, 43.80, 53.10, 80.10
+- MAF scale calibration extended to 280 g/s (64 points)
+- Different `load_max` values (5.00 g/rev across all RPM)
+- Higher `boost_target` values: up to 199.5 kPa (vs 208.0 kPa in base)
+- DFCO configured with moderate delay (4 counts) and standard thresholds
+- More aggressive spark advance in base_spark_at (up to 48°)
+- Modified `wideband_cal` range (0.500-1.523 λ)
+- Comments indicate fuel adjustments: "-10% from load comp table; +10% to base inj pulse crank; v6 leaned power target by 5%"
+- Boost proportional control enabled (`boost_prop_enable: 1`)
+- Higher integral limit for wastegate control (10.2% vs 0.0% in base)
+
 ### Key Differences in Tuned Files:
-1. **Boost Targets**: v3 and v7 have significantly higher boost targets (up to 230.4 kPa vs 208.0 kPa in base)
+1. **Boost Targets**: v3, v7, v10 have significantly higher boost targets (up to 230.4 kPa vs 208.0 kPa in base)
 2. **Fuel Base**: Tuned files have richer fueling in high-load regions
 3. **Spark Timing**: More aggressive spark advance in tuned files (up to 48° vs 44° in base)
-4. **PE Lambda**: More aggressive enrichment (richer) in tuned files
-5. **Wastegate Control**: More aggressive wastegate duty cycles in tuned files
+4. **PE Lambda**: More aggressive enrichment (richer) in tuned files; v10 leaned by 5% from v6
+5. **Wastegate Control**: More aggressive wastegate duty cycles and integral control in tuned files
 6. **Load Limits**: Tuned files allow higher load limits (5.00 vs 2.54 g/rev)
+7. **DFCO Configuration**: v10 maintains moderate DFCO settings (not modified for burble tuning yet)
 
 ---
 
@@ -882,6 +1106,7 @@ The ECU tune file contains **157 unique maps/parameters** organized into **28 fu
 - Boost control with closed-loop wastegate management
 - Idle control with adaptive air valve management
 - Safety systems (knock detection, rev limiting, speed limiting)
+- DFCO (Deceleration Fuel Cut-Off) with multi-condition activation logic
 - Sensor calibrations (MAF, MAP, IAT, ECT, wideband)
 
-All tables are interconnected through shared indexes (RPM, Load, TPS, ECT, etc.) and dependencies. The tuned files (v3, v7) show modifications for performance tuning with extended load ranges, higher boost targets, and more aggressive fuel and spark values.
+All tables are interconnected through shared indexes (RPM, Load, TPS, ECT, etc.) and dependencies. The tuned files (v3, v7, v10) show modifications for performance tuning with extended load ranges, higher boost targets, and more aggressive fuel and spark values. DFCO system configuration is critical for burble tuning applications (requires delay/disable modifications).
